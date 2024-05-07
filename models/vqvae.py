@@ -92,4 +92,4 @@ class VQVAE(nn.Module):
     def load_state_dict(self, state_dict: Dict[str, Any], strict=True, assign=False):
         if 'quantize.ema_vocab_hit_SV' in state_dict and state_dict['quantize.ema_vocab_hit_SV'].shape[0] != self.quantize.ema_vocab_hit_SV.shape[0]:
             state_dict['quantize.ema_vocab_hit_SV'] = self.quantize.ema_vocab_hit_SV
-        return super().load_state_dict(state_dict=state_dict, strict=strict, assign=assign)
+        return super().load_state_dict(state_dict=state_dict, strict=strict)
