@@ -126,7 +126,7 @@ class VAR_FHAT(nn.Module):
     @torch.no_grad()
     def autoregressive_infer_cfg(
         self, B: int, label_B: Optional[Union[int, torch.LongTensor]],
-        g_seed: Optional[int] = None, cfg=1.5,pag = 1.5, top_k=0, top_p=0.0,
+        g_seed: Optional[int] = None, cfg=1.5, top_k=0, top_p=0.0,
         more_smooth=False,
     ) -> torch.Tensor:   # returns reconstructed image (B, 3, H, W) in [0, 1]
         """
@@ -157,7 +157,6 @@ class VAR_FHAT(nn.Module):
         f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
         
         f_hat_list = torch.FloatTensor().to(self.lvl_1L.device)
-        
         for b in self.blocks: b.attn.kv_caching(True)
         for si, pn in enumerate(self.patch_nums):   # si: i-th segment
             ratio = si / self.num_stages_minus_1
@@ -166,23 +165,13 @@ class VAR_FHAT(nn.Module):
             # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
             cond_BD_or_gss = self.shared_ada_lin(cond_BD)
             x = next_token_map
-            x_bar = next_token_map
             AdaLNSelfAttn.forward
+            for b in self.blocks:
+                x = b(x=x, cond_BD=cond_BD_or_gss, attn_bias=None)
+            logits_BlV = self.get_logits(x, cond_BD)
+            
             t = cfg * ratio
-            p = pag * ratio
-            if pag != 0:
-                for b in self.blocks:
-                    x = b(x=x, cond_BD=cond_BD_or_gss, attn_bias=None, pag = False)
-                    x_bar = b(x=x_bar, cond_BD=cond_BD_or_gss, attn_bias=None, pag = True)
-                    
-                logits_BlV = self.get_logits(x, cond_BD)
-                pag_logits_BlV = self.get_logits(x_bar, cond_BD)
-                logits_BlV = logits_BlV[:B] + (t - 1.0)*(logits_BlV[:B] - logits_BlV[B:]) + p * (logits_BlV[:B] - pag_logits_BlV[:B])
-            else:
-                for b in self.blocks:
-                    x = b(x=x, cond_BD=cond_BD_or_gss, attn_bias=None, pag = False)           
-                logits_BlV = self.get_logits(x, cond_BD)
-                logits_BlV = (1+t) * logits_BlV[:B] - t * logits_BlV[B:]        
+            logits_BlV = (1+t) * logits_BlV[:B] - t * logits_BlV[B:]
             
             idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
             if not more_smooth: # this is the default case
@@ -193,6 +182,7 @@ class VAR_FHAT(nn.Module):
             
             h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, pn, pn)
             f_hat, next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(si, len(self.patch_nums), f_hat, h_BChw)
+
             f_hat_list = torch.cat((f_hat_list,f_hat),dim=0)
             if si != self.num_stages_minus_1:   # prepare for next stage
                 next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)

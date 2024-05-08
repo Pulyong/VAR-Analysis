@@ -21,6 +21,20 @@
 
 ## Analysis
 
+### How Model Generate Image?
+Generate Image with depth 30 model
+
+<img src="./analysis/demo_patch.png" width=90%>
+
+* Model Generate Image Coarse-to-Fine
+* low resolution token determines the overall color
+* high resolution token gradually adds detailed information in a residual manner
+
+### Failure Image
+<img src="./analysis/demo_fail.png" width=90%>  
+
+* Model can't generate person (I think this is becuase there is no prior on people)
+* Model can't generate when there are multiple objects (I guess...)
 
 ## License
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

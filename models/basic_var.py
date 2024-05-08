@@ -22,21 +22,20 @@ try: from xformers.ops import memory_efficient_attention
 except ImportError: pass
 try: from flash_attn import flash_attn_func              # qkv: BLHc, ret: BLHcq
 except ImportError: pass
+'''
 try: from torch.nn.functional import scaled_dot_product_attention as slow_attn    # q, k, v: BHLc
 except ImportError:
     def slow_attn(query, key, value, scale: float, attn_mask=None, dropout_p=0.0):
         attn = query.mul(scale) @ key.transpose(-2, -1) # BHLc @ BHcL => BHLL
         if attn_mask is not None: attn.add_(attn_mask)
         return (F.dropout(attn.softmax(dim=-1), p=dropout_p, inplace=True) if dropout_p > 0 else attn.softmax(dim=-1)) @ value
+'''
     
 def slow_attn(query, key, value, scale: float, attn_mask=None, dropout_p=0.0):
-    attn = query.mul(scale) @ key.transpose(-2, -1) # BHLc @ BHcL => BHLL
-    if attn_mask is not None: attn.add_(attn_mask)
+        attn = query.mul(scale) @ key.transpose(-2, -1) # BHLc @ BHcL => BHLL
+        if attn_mask is not None: attn.add_(attn_mask)
+        return (F.dropout(attn.softmax(dim=-1), p=dropout_p, inplace=True) if dropout_p > 0 else attn.softmax(dim=-1)) @ value
 
-    return (F.dropout(attn.softmax(dim=-1), p=dropout_p, inplace=True) if dropout_p > 0 else attn.softmax(dim=-1)) @ value
-
-def pag_attn(query, key, value, scale: float, attn_mask=None, dropout_p=0.0):
-    return value
 
 class FFN(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, drop=0., fused_if_available=True):
@@ -95,7 +94,7 @@ class SelfAttention(nn.Module):
     def kv_caching(self, enable: bool): self.caching, self.cached_k, self.cached_v = enable, None, None
     
     # NOTE: attn_bias is None during inference because kv cache is enabled
-    def forward(self, x, pag, attn_bias):
+    def forward(self, x, attn_bias):
         B, L, C = x.shape
         
         qkv = F.linear(input=x, weight=self.mat_qkv.weight, bias=torch.cat((self.q_bias, self.zero_k_bias, self.v_bias))).view(B, L, 3, self.num_heads, self.head_dim)
@@ -112,21 +111,17 @@ class SelfAttention(nn.Module):
             q = F.normalize(q, dim=-1).mul(scale_mul)
             k = F.normalize(k, dim=-1)
         
-        if not pag:
-            if self.caching:
-                if self.cached_k is None: self.cached_k = k; self.cached_v = v
-                else: k = self.cached_k = torch.cat((self.cached_k, k), dim=dim_cat); v = self.cached_v = torch.cat((self.cached_v, v), dim=dim_cat)
-                
+        if self.caching:
+            if self.cached_k is None: self.cached_k = k; self.cached_v = v
+            else: k = self.cached_k = torch.cat((self.cached_k, k), dim=dim_cat); v = self.cached_v = torch.cat((self.cached_v, v), dim=dim_cat)
+        
         dropout_p = self.attn_drop if self.training else 0.0
         if using_flash:
             oup = flash_attn_func(q.to(dtype=main_type), k.to(dtype=main_type), v.to(dtype=main_type), dropout_p=dropout_p, softmax_scale=self.scale).view(B, L, C)
         elif self.using_xform:
             oup = memory_efficient_attention(q.to(dtype=main_type), k.to(dtype=main_type), v.to(dtype=main_type), attn_bias=None if attn_bias is None else attn_bias.to(dtype=main_type).expand(B, self.num_heads, -1, -1), p=dropout_p, scale=self.scale).view(B, L, C)
         else:
-            if pag:
-                oup = pag_attn(query=q, key=k, value=v, scale=self.scale, attn_mask=attn_bias, dropout_p=dropout_p).transpose(1, 2).reshape(B, L, C)
-            else:
-                oup = slow_attn(query=q, key=k, value=v, scale=self.scale, attn_mask=attn_bias, dropout_p=dropout_p).transpose(1, 2).reshape(B, L, C)
+            oup = slow_attn(query=q, key=k, value=v, scale=self.scale, attn_mask=attn_bias, dropout_p=dropout_p).transpose(1, 2).reshape(B, L, C)
         
         return self.proj_drop(self.proj(oup))
         # attn = (q @ k.transpose(-2, -1)).add_(attn_bias + self.local_rpb())  # BHLc @ BHcL => BHLL
@@ -141,7 +136,7 @@ class AdaLNSelfAttn(nn.Module):
     def __init__(
         self, block_idx, last_drop_p, embed_dim, cond_dim, shared_aln: bool, norm_layer,
         num_heads, mlp_ratio=4., drop=0., attn_drop=0., drop_path=0., attn_l2_norm=False,
-        flash_if_available=False, fused_if_available=True
+        flash_if_available=False, fused_if_available=True,
     ):
         super(AdaLNSelfAttn, self).__init__()
         self.block_idx, self.last_drop_p, self.C = block_idx, last_drop_p, embed_dim
@@ -149,7 +144,6 @@ class AdaLNSelfAttn(nn.Module):
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.attn = SelfAttention(block_idx=block_idx, embed_dim=embed_dim, num_heads=num_heads, attn_drop=attn_drop, proj_drop=drop, attn_l2_norm=attn_l2_norm, flash_if_available=flash_if_available)
         self.ffn = FFN(in_features=embed_dim, hidden_features=round(embed_dim * mlp_ratio), drop=drop, fused_if_available=fused_if_available)
-        
         
         self.ln_wo_grad = norm_layer(embed_dim, elementwise_affine=False)
         self.shared_aln = shared_aln
@@ -162,12 +156,12 @@ class AdaLNSelfAttn(nn.Module):
         self.fused_add_norm_fn = None
     
     # NOTE: attn_bias is None during inference because kv cache is enabled
-    def forward(self, x, cond_BD, attn_bias, pag):   # C: embed_dim, D: cond_dim
+    def forward(self, x, cond_BD, attn_bias):   # C: embed_dim, D: cond_dim
         if self.shared_aln:
             gamma1, gamma2, scale1, scale2, shift1, shift2 = (self.ada_gss + cond_BD).unbind(2) # 116C + B16C =unbind(2)=> 6 B1C
         else:
             gamma1, gamma2, scale1, scale2, shift1, shift2 = self.ada_lin(cond_BD).view(-1, 1, 6, self.C).unbind(2)
-        x = x + self.drop_path(self.attn( self.ln_wo_grad(x).mul(scale1.add(1)).add_(shift1),pag ,attn_bias=attn_bias).mul_(gamma1))
+        x = x + self.drop_path(self.attn( self.ln_wo_grad(x).mul(scale1.add(1)).add_(shift1), attn_bias=attn_bias ).mul_(gamma1))
         x = x + self.drop_path(self.ffn( self.ln_wo_grad(x).mul(scale2.add(1)).add_(shift2) ).mul(gamma2)) # this mul(gamma2) cannot be in-placed when FusedMLP is used
         return x
     
